@@ -1190,9 +1190,9 @@ Gpu* Gpu::create_metal(void* device_handle, const std::string& metallib_path, st
     MTL::Library* library = device->newLibrary(path, &err);
     std::vector<MTL::Library*> libraries;
     if (library) libraries.push_back(library);
-#if TARGET_OS_IPHONE
     // An iOS build can bundle the MSL sources when the offline Metal toolchain
-    // is unavailable. Compile each translation unit separately so its private
+    // is unavailable. The macOS preview generator uses this path too. Compile
+    // each translation unit separately so its private
     // helpers have the same scope as in the original metallib build.
     if (libraries.empty()) {
         const std::string root = metallib_path.substr(0, metallib_path.find_last_of('/'));
@@ -1235,7 +1235,6 @@ Gpu* Gpu::create_metal(void* device_handle, const std::string& metallib_path, st
         }
         options->release();
     }
-#endif
     if (libraries.empty() || !error.empty()) {
         for (auto* item : libraries) item->release();
         if (error.empty())

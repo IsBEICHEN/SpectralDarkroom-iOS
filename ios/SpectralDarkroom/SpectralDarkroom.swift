@@ -46,6 +46,100 @@ private enum RenderError: Error, LocalizedError {
     }
 }
 
+private struct RenderSettings: Sendable, Hashable {
+    var exposure = 0.0
+    var autoExposure = true
+    var filmFormat = 35.0
+    var lensBlur = 0.0
+    var scannerBlur = 0.0
+    var printExposure = 1.0
+    var magenta = 0.0
+    var yellow = 0.0
+    var filterScale = 20.0
+    var preflash = 0.0
+    var grain = 1.0
+    var grainActive = true
+    var halation = 1.0
+    var halationBoost = 0.0
+    var scatter = 1.0
+    var halationActive = true
+    var dirCouplers = 1.0
+    var dirActive = true
+    var densityGamma = 1.0
+    var glare = 1.0
+    var glareActive = true
+    var contrastMaskActive = false
+    var contrastHighlights = 0.0
+    var contrastShadows = 0.0
+    var contrastCore = 1.0
+    var contrastScale = 0.03
+    var paperGrade = "2"
+    var latitudeActive = false
+    var highlightKnee = 2.0
+    var highlightRoom = 0.0
+    var shadowKnee = -2.0
+    var shadowRoom = 0.0
+    var latitudeRolloff = 2.0
+    var antiHalationRemoved = false
+    var scannerWhite = false
+    var scannerBlack = false
+
+    var wire: [String: Any] {
+        [
+            "exposure_compensation_ev": exposure,
+            "auto_exposure": autoExposure,
+            "film_format_mm": filmFormat,
+            "lens_blur_um": lensBlur,
+            "scanner_lens_blur": scannerBlur,
+            "print_exposure": printExposure,
+            "m_filter_shift": magenta,
+            "y_filter_shift": yellow,
+            "filter_shift_scale": filterScale,
+            "preflash_exposure": preflash,
+            "grain_active": grainActive,
+            "grain_amount": grain,
+            "halation_active": halationActive,
+            "halation_amount": halation,
+            "halation_boost_ev": halationBoost,
+            "halation_scatter_amount": scatter,
+            "dir_couplers_active": dirActive,
+            "dir_couplers_amount": dirCouplers,
+            "density_curve_gamma": densityGamma,
+            "glare_active": glareActive,
+            "glare_amount": glare,
+            "contrast_mask_active": contrastMaskActive,
+            "contrast_mask_highlights": contrastHighlights,
+            "contrast_mask_shadows": contrastShadows,
+            "contrast_mask_core": contrastCore,
+            "contrast_mask_scale": contrastScale,
+            "scene_latitude_active": latitudeActive,
+            "scene_latitude_highlight_knee": highlightKnee,
+            "scene_latitude_highlight_room": highlightRoom,
+            "scene_latitude_shadow_knee": shadowKnee,
+            "scene_latitude_shadow_room": shadowRoom,
+            "scene_latitude_rolloff": latitudeRolloff,
+            "antihalation_removed": antiHalationRemoved,
+            "scanner_white_correction": scannerWhite,
+            "scanner_black_correction": scannerBlack,
+        ]
+    }
+}
+
+private struct PaperGrades: Decodable {
+    struct Grade: Decodable {
+        let m_filter_neutral: Double
+        let y_filter_neutral: Double
+        let print_exposure: Double
+    }
+    let grades: [String: Grade]
+
+    static let bundled: PaperGrades? = {
+        guard let url = Bundle.main.url(forResource: "paper_grades", withExtension: "json"),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(PaperGrades.self, from: data)
+    }()
+}
+
 // All engine calls stay on this actor. C's thread-local error string must be
 // copied before another operation; the rgba16 result is copied before release.
 private actor FilmEngine {
@@ -55,10 +149,16 @@ private actor FilmEngine {
     private var pixels: [Float] = []
     private var width = 0
     private var height = 0
+    private let maxEdge: CGFloat
+    private let previewLongEdge: Int
 
-    func render(url: URL, film: String, paper: String,
-                exposure: Double, printExposure: Double,
-                grain: Double, tier: String) throws -> RenderedFrame {
+    init(maxEdge: CGFloat = 4096, previewLongEdge: Int = 1600) {
+        self.maxEdge = maxEdge
+        self.previewLongEdge = previewLongEdge
+    }
+
+    func render(url: URL, film: String, paper: String, scanFilm: Bool,
+                settings: RenderSettings, tier: String) throws -> RenderedFrame {
         if engine == nil {
             guard let resources = Bundle.main.resourceURL?.appendingPathComponent("engine"),
                   let created = spk_engine_create(resources.path, nil) else {
@@ -73,18 +173,25 @@ private actor FilmEngine {
         if let session { spk_session_release(session) }
         session = nil
 
-        let settings: [String: Any] = [
+        var wire: [String: Any] = [
             "film_stock": film,
             "print_stock": paper,
+            "scan_film": scanFilm,
             "input_color_space": "sRGB",
             "input_cctf_decoding": false,
             "output_color_space": "Display P3",
-            "preview_long_edge": 1600,
-            "exposure_compensation_ev": exposure,
-            "print_exposure": printExposure,
-            "grain_amount": grain,
+            "preview_long_edge": previewLongEdge,
         ]
-        let json = try JSONSerialization.data(withJSONObject: settings)
+        wire.merge(settings.wire) { _, new in new }
+        if !scanFilm, paper == "ilford_multigrade_iv_rc",
+           let grade = PaperGrades.bundled?.grades[settings.paperGrade] {
+            wire["c_filter_neutral"] = 0
+            wire["m_filter_neutral"] = grade.m_filter_neutral
+            wire["y_filter_neutral"] = grade.y_filter_neutral
+            wire["print_exposure"] = settings.printExposure * grade.print_exposure
+            wire["grain_sublayers_active"] = false
+        }
+        let json = try JSONSerialization.data(withJSONObject: wire)
         guard let delta = String(data: json, encoding: .utf8) else {
             throw RenderError.message("无法编码胶片设置")
         }
@@ -137,9 +244,9 @@ private actor FilmEngine {
             throw RenderError.message("无法解码照片；请尝试 JPEG、HEIC 或受系统支持的 RAW")
         }
         let longEdge = max(image.extent.width, image.extent.height)
-        if longEdge > 4096 {
-            image = image.transformed(by: CGAffineTransform(scaleX: 4096 / longEdge,
-                                                             y: 4096 / longEdge))
+        if longEdge > maxEdge {
+            image = image.transformed(by: CGAffineTransform(scaleX: maxEdge / longEdge,
+                                                             y: maxEdge / longEdge))
         }
         let bounds = image.extent.integral
         let w = Int(bounds.width)
@@ -157,10 +264,118 @@ private actor FilmEngine {
     }
 }
 
-private struct Stock: Identifiable {
+private struct Stock: Identifiable, Decodable {
     let id: String
     let label: String
     let originalName: String
+    let targetPrint: String
+    let category: String
+    let positive: Bool
+    let strongHalation: Bool
+    let calibratedPapers: [String]
+
+    var iso: Int {
+        originalName.split(whereSeparator: { !$0.isNumber })
+            .compactMap { Int($0) }
+            .first(where: { $0 >= 25 }) ?? Int.max
+    }
+}
+
+private enum StockSort: String {
+    case defaultOrder = "default"
+    case name = "name"
+    case iso = "iso"
+    case recent = "recent"
+    case custom = "custom"
+
+    var title: String {
+        switch self {
+        case .defaultOrder: "默认"
+        case .name: "名称"
+        case .iso: "感光度"
+        case .recent: "最近使用"
+        case .custom: "自定义"
+        }
+    }
+}
+
+private struct StockPreviewCard: View {
+    let stock: Stock
+    let chosen: Bool
+    let available: Bool
+    let isFilm: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: .bottomLeading) {
+                RoundedRectangle(cornerRadius: 15)
+                    .fill(
+                        LinearGradient(
+                            colors: chosen
+                                ? [Color(red: 0.31, green: 0.26, blue: 0.20),
+                                   Color(red: 0.18, green: 0.18, blue: 0.17)]
+                                : [Color.white.opacity(0.09), Color.white.opacity(0.045)],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        )
+                    )
+                if let url = Bundle.main.url(forResource: stock.id, withExtension: "jpg",
+                                              subdirectory: isFilm ? "StockPreviews/films" : "StockPreviews/papers"),
+                   let image = UIImage(contentsOfFile: url.path) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 160, height: 114)
+                        .clipped()
+                }
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.86)],
+                    startPoint: .top, endPoint: .bottom
+                )
+                VStack(alignment: .leading, spacing: 3) {
+                    Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 15))
+                        .foregroundStyle(chosen ? DarkroomStyle.accent : .white.opacity(0.75))
+                    Spacer(minLength: 0)
+                    Text(stock.label)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(stock.strongHalation ? "强光晕 · \(stock.originalName)" : stock.originalName)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .lineLimit(1)
+                }
+                .padding(12)
+            }
+            .frame(width: 160, height: 114)
+            .clipShape(RoundedRectangle(cornerRadius: 15))
+            .overlay {
+                RoundedRectangle(cornerRadius: 15)
+                    .strokeBorder(chosen ? DarkroomStyle.accent.opacity(0.8)
+                                         : .white.opacity(0.12), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(!available)
+        .opacity(available ? 1 : 0.36)
+        .accessibilityLabel(available ? stock.label : "\(stock.label)，当前胶片不可搭配")
+        .accessibilityAddTraits(chosen ? .isSelected : [])
+    }
+}
+
+private struct StockCatalog: Decodable {
+    let films: [Stock]
+    let papers: [Stock]
+
+    static func load() -> StockCatalog {
+        guard let url = Bundle.main.url(forResource: "stock-catalog", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let catalog = try? JSONDecoder().decode(StockCatalog.self, from: data) else {
+            return StockCatalog(films: [], papers: [])
+        }
+        return catalog
+    }
 }
 
 private enum DarkroomStyle {
@@ -230,25 +445,27 @@ private struct EditorView: View {
     @State private var isWorking = false
     @State private var error: String?
     @State private var activePanel: EditPanel = .film
+    @State private var showingAdjustments = false
+    @State private var showingStockOrder = false
+    @State private var showingStockBrowser = false
+    @State private var browsingFilm = true
+    @State private var stockQuery = ""
+    @State private var browserCategory = "全部"
+    @State private var editingFilmOrder = true
+    @State private var draftOrder: [String] = []
+    @AppStorage("filmStockSort") private var filmSort = StockSort.defaultOrder.rawValue
+    @AppStorage("paperStockSort") private var paperSort = StockSort.defaultOrder.rawValue
+    @AppStorage("filmCustomOrder") private var filmOrder = ""
+    @AppStorage("paperCustomOrder") private var paperOrder = ""
+    @AppStorage("filmRecentUse") private var filmRecentUse = ""
+    @AppStorage("paperRecentUse") private var paperRecentUse = ""
     @State private var film = "kodak_portra_400"
     @State private var paper = "kodak_portra_endura"
-    @State private var exposure = 0.0
-    @State private var printExposure = 1.0
-    @State private var grain = 1.0
+    @State private var scanFilm = false
+    @State private var settings = RenderSettings()
     @State private var engine = FilmEngine()
 
-    private let films = [
-        Stock(id: "kodak_portra_400", label: "柯达人像 400", originalName: "Portra 400"),
-        Stock(id: "kodak_portra_160", label: "柯达人像 160", originalName: "Portra 160"),
-        Stock(id: "kodak_gold_200", label: "柯达金 200", originalName: "Gold 200"),
-        Stock(id: "fujifilm_pro_400h", label: "富士专业 400H", originalName: "Pro 400H"),
-    ]
-    private let papers = [
-        Stock(id: "kodak_portra_endura", label: "柯达人像 Endura", originalName: "Portra Endura"),
-        Stock(id: "fujifilm_crystal_archive_typeii", label: "富士晶彩 II",
-              originalName: "Crystal Archive Type II"),
-        Stock(id: "kodak_2383", label: "柯达 2383", originalName: "Kodak 2383"),
-    ]
+    private let catalog = StockCatalog.load()
 
     var body: some View {
         GeometryReader { geometry in
@@ -265,7 +482,7 @@ private struct EditorView: View {
                     .padding(.bottom, 16)
 
                 controls
-                    .frame(height: compact ? 174 : 212)
+                    .frame(height: compact ? 208 : 242)
                     .frame(maxWidth: .infinity)
                     .background(DarkroomStyle.panel, in: RoundedRectangle(cornerRadius: 28))
                     .overlay {
@@ -287,6 +504,15 @@ private struct EditorView: View {
             }
             .sheet(isPresented: $showingHistory) {
                 historyView
+            }
+            .sheet(isPresented: $showingAdjustments) {
+                adjustmentSheet
+            }
+            .sheet(isPresented: $showingStockOrder) {
+                stockOrderSheet
+            }
+            .sheet(isPresented: $showingStockBrowser) {
+                stockBrowserSheet
             }
             .alert("无法完成冲印", isPresented: Binding(
                 get: { error != nil },
@@ -410,16 +636,35 @@ private struct EditorView: View {
             ScrollView {
                 Group {
                     switch activePanel {
-                    case .film: stockChoices(films, selection: $film, subtitle: "FILM STOCK")
-                    case .paper: stockChoices(papers, selection: $paper, subtitle: "PRINT PAPER")
+                    case .film:
+                        stockChoices(catalog.films, subtitle: "FILM STOCK", isFilm: true)
+                    case .paper:
+                        if selectedFilm?.positive == true {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Label("直接扫描", systemImage: "scanner")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundStyle(DarkroomStyle.accent)
+                                Text("反转片按原始胶片观看，无需选择相纸")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(DarkroomStyle.muted)
+                            }
+                            .padding(.horizontal, 24)
+                        } else {
+                            stockChoices(catalog.papers, subtitle: "PRINT PAPER", isFilm: false)
+                        }
                     case .adjust:
-                        VStack(spacing: 9) {
-                            adjustment("胶片曝光", value: $exposure, range: -4...4,
+                        VStack(alignment: .leading, spacing: 8) {
+                            adjustment("胶片曝光", value: $settings.exposure, range: -8...8,
                                        format: "%.1f EV")
-                            adjustment("印相曝光", value: $printExposure, range: 0.5...2,
+                            adjustment("印相曝光", value: $settings.printExposure, range: 0.05...4,
                                        format: "%.2f")
-                            adjustment("颗粒", value: $grain, range: 0...2,
-                                       format: "%.1f")
+                            Button {
+                                showingAdjustments = true
+                            } label: {
+                                Label("展开全部微调参数", systemImage: "slider.horizontal.3")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .padding(.horizontal, 24)
                         }
                     }
                 }
@@ -436,35 +681,51 @@ private struct EditorView: View {
                 Text(selectedURL == nil ? "等待照片" : "已载入 · 调整后自动冲印")
                     .font(.system(size: 11, weight: .medium))
                 Spacer()
-                Text("原片保留")
+                Text(pairStatus)
                     .font(.system(size: 11))
             }
             .foregroundStyle(DarkroomStyle.muted)
             .padding(.horizontal, 24)
+            .padding(.top, 14)
             .padding(.bottom, 9)
         }
     }
 
+    private var pairStatus: String {
+        if scanFilm { return "直接扫描" }
+        return "原片保留"
+    }
+
+    private var selectedFilm: Stock? {
+        catalog.films.first(where: { $0.id == film })
+    }
+
     private var bottomNavigation: some View {
         HStack(spacing: 10) {
-            navigationItems
-                .frame(maxWidth: .infinity)
-                .modifier(NavigationGlass())
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 20)
-                        .onEnded { gesture in
-                            guard abs(gesture.translation.width) > 36,
-                                  abs(gesture.translation.width) > abs(gesture.translation.height)
-                            else { return }
-                            let panels = EditPanel.allCases
-                            guard let current = panels.firstIndex(of: activePanel) else { return }
-                            let next = min(max(current + (gesture.translation.width < 0 ? 1 : -1),
-                                               0), panels.count - 1)
-                            withAnimation(.snappy(duration: 0.24)) {
-                                activePanel = panels[next]
+            GeometryReader { area in
+                navigationItems
+                    .frame(width: area.size.width, height: 58)
+                    .contentShape(Rectangle())
+                    .highPriorityGesture(
+                        DragGesture(minimumDistance: 8)
+                            .onChanged { gesture in
+                                guard abs(gesture.translation.width) >
+                                      abs(gesture.translation.height) else { return }
+                                let width = area.size.width
+                                guard width > 0 else { return }
+                                let index = min(max(Int(gesture.location.x / (width / 3)), 0), 2)
+                                let panel = EditPanel.allCases[index]
+                                if activePanel != panel {
+                                    withAnimation(.snappy(duration: 0.16)) {
+                                        activePanel = panel
+                                    }
+                                }
                             }
-                        }
-                )
+                    )
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 58)
+            .modifier(NavigationGlass())
             Button {
                 records = loadRecords()
                 showingHistory = true
@@ -513,61 +774,311 @@ private struct EditorView: View {
         .padding(3)
     }
 
-    private func stockChoices(_ stocks: [Stock], selection: Binding<String>,
-                              subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(subtitle)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .tracking(2)
-                .foregroundStyle(DarkroomStyle.muted)
-                .padding(.horizontal, 24)
-            ScrollView(.horizontal) {
-                HStack(spacing: 10) {
-                    ForEach(stocks) { stock in
-                        let chosen = selection.wrappedValue == stock.id
+    private func stockChoices(_ stocks: [Stock], subtitle: String, isFilm: Bool) -> some View {
+        let sort = StockSort(rawValue: isFilm ? filmSort : paperSort) ?? .defaultOrder
+        let sorted = orderedStocks(stocks, isFilm: isFilm)
+        let ordered = isFilm ? sorted : sorted.filter(isPaperCompatible)
+            + sorted.filter { !isPaperCompatible($0) }
+        let selected = isFilm ? film : paper
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(subtitle)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(2)
+                    .foregroundStyle(DarkroomStyle.muted)
+                Spacer()
+                Button {
+                    browsingFilm = isFilm
+                    stockQuery = ""
+                    browserCategory = "全部"
+                    showingStockBrowser = true
+                } label: {
+                    Label("查找", systemImage: "magnifyingglass")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .accessibilityLabel(isFilm ? "查找胶片" : "查找相纸")
+                Menu {
+                    ForEach(isFilm ? [StockSort.defaultOrder, .name, .iso, .recent, .custom]
+                                   : [StockSort.defaultOrder, .name, .recent, .custom],
+                            id: \.rawValue) { option in
                         Button {
-                            selection.wrappedValue = stock.id
-                            if selectedURL != nil { process(tier: "live") }
+                            if isFilm { filmSort = option.rawValue }
+                            else { paperSort = option.rawValue }
+                            if option == .custom { openStockOrder(isFilm: isFilm) }
                         } label: {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Image(systemName: chosen ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 15))
-                                    .foregroundStyle(chosen ? DarkroomStyle.accent : .white.opacity(0.3))
-                                Spacer(minLength: 0)
-                                Text(stock.label)
-                                    .font(.system(size: 14, weight: .medium))
-                                    .foregroundStyle(.white)
-                                    .lineLimit(1)
-                                Text(stock.originalName)
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(DarkroomStyle.muted)
-                                    .lineLimit(1)
-                            }
-                            .frame(width: 136, height: 90, alignment: .leading)
-                            .padding(12)
-                            .background(
-                                LinearGradient(
-                                    colors: chosen
-                                        ? [Color(red: 0.31, green: 0.26, blue: 0.20),
-                                           Color(red: 0.18, green: 0.18, blue: 0.17)]
-                                        : [Color.white.opacity(0.09), Color.white.opacity(0.045)],
-                                    startPoint: .topLeading, endPoint: .bottomTrailing
-                                ),
-                                in: RoundedRectangle(cornerRadius: 15)
-                            )
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 15)
-                                    .strokeBorder(chosen ? DarkroomStyle.accent.opacity(0.6)
-                                                         : .white.opacity(0.08), lineWidth: 1)
+                            if sort == option {
+                                Label(option.title, systemImage: option == .custom
+                                      ? "line.3.horizontal.decrease" : "checkmark")
+                            } else {
+                                Text(option.title)
                             }
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityAddTraits(chosen ? .isSelected : [])
+                    }
+                } label: {
+                    Label("排序：\(sort.title)", systemImage: "arrow.up.arrow.down")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .accessibilityLabel("材料排序")
+            }
+            .padding(.horizontal, 24)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    LazyHStack(spacing: 10) {
+                        ForEach(ordered) { stock in
+                            let chosen = selected == stock.id
+                            let available = isFilm || isPaperCompatible(stock)
+                            StockPreviewCard(
+                                stock: stock, chosen: chosen, available: available,
+                                isFilm: isFilm
+                            ) {
+                                chooseStock(stock, isFilm: isFilm)
+                            }
+                            .id(stock.id)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                }
+                .scrollIndicators(.hidden)
+                .onAppear {
+                    DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
+                }
+                .onChange(of: activePanel) { _, panel in
+                    if panel == (isFilm ? .film : .paper) {
+                        DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
                     }
                 }
-                .padding(.horizontal, 24)
+                .onChange(of: selected) { _, id in
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                }
+                .onChange(of: sort) { _, _ in
+                    DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
+                }
             }
-            .scrollIndicators(.hidden)
+            .id(isFilm ? "film-cards" : "paper-cards")
+        }
+    }
+
+    private func chooseStock(_ stock: Stock, isFilm: Bool) {
+        if isFilm {
+            film = stock.id
+            markUsed(stock.id, isFilm: true)
+            if stock.positive {
+                scanFilm = true
+            } else {
+                scanFilm = false
+                if stock.calibratedPapers.contains(stock.targetPrint) {
+                    paper = stock.targetPrint
+                    markUsed(paper, isFilm: false)
+                }
+            }
+        } else {
+            guard isPaperCompatible(stock) else { return }
+            paper = stock.id
+            scanFilm = false
+            markUsed(stock.id, isFilm: false)
+        }
+        if selectedURL != nil { process(tier: "live") }
+    }
+
+    private func isPaperCompatible(_ stock: Stock) -> Bool {
+        selectedFilm?.positive == false
+            && (selectedFilm?.calibratedPapers.contains(stock.id) ?? false)
+    }
+
+    private func orderedStocks(_ stocks: [Stock], isFilm: Bool) -> [Stock] {
+        let sort = StockSort(rawValue: isFilm ? filmSort : paperSort) ?? .defaultOrder
+        let custom = (isFilm ? filmOrder : paperOrder).split(separator: ",").map(String.init)
+        let recent = recentUse(isFilm: isFilm)
+        let initial = Dictionary(uniqueKeysWithValues: stocks.enumerated().map { ($0.element.id, $0.offset) })
+        switch sort {
+        case .defaultOrder:
+            return stocks
+        case .name:
+            return stocks.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+        case .iso:
+            return stocks.sorted {
+                $0.iso == $1.iso
+                    ? $0.label.localizedStandardCompare($1.label) == .orderedAscending
+                    : $0.iso < $1.iso
+            }
+        case .recent:
+            return stocks.sorted {
+                let first = recent[$0.id] ?? 0
+                let second = recent[$1.id] ?? 0
+                return first == second
+                    ? (initial[$0.id] ?? 0) < (initial[$1.id] ?? 0)
+                    : first > second
+            }
+        case .custom:
+            return stocks.sorted {
+                let first = custom.firstIndex(of: $0.id) ?? custom.count + (initial[$0.id] ?? 0)
+                let second = custom.firstIndex(of: $1.id) ?? custom.count + (initial[$1.id] ?? 0)
+                return first < second
+            }
+        }
+    }
+
+    private func recentUse(isFilm: Bool) -> [String: TimeInterval] {
+        let stored = isFilm ? filmRecentUse : paperRecentUse
+        return (try? JSONDecoder().decode([String: TimeInterval].self, from: Data(stored.utf8))) ?? [:]
+    }
+
+    private func markUsed(_ id: String, isFilm: Bool) {
+        var usage = recentUse(isFilm: isFilm)
+        usage[id] = Date().timeIntervalSince1970
+        guard let data = try? JSONEncoder().encode(usage),
+              let value = String(data: data, encoding: .utf8) else { return }
+        if isFilm { filmRecentUse = value }
+        else { paperRecentUse = value }
+    }
+
+    private func openStockOrder(isFilm: Bool) {
+        editingFilmOrder = isFilm
+        draftOrder = orderedStocks(isFilm ? catalog.films : catalog.papers, isFilm: isFilm)
+            .map(\.id)
+        showingStockOrder = true
+    }
+
+    private var stockOrderSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(draftOrder, id: \.self) { id in
+                        if let stock = (editingFilmOrder ? catalog.films : catalog.papers)
+                            .first(where: { $0.id == id }) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(stock.label)
+                                Text(stock.originalName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .onMove { source, destination in
+                        draftOrder.move(fromOffsets: source, toOffset: destination)
+                        let stored = draftOrder.joined(separator: ",")
+                        if editingFilmOrder {
+                            filmOrder = stored
+                            filmSort = StockSort.custom.rawValue
+                        } else {
+                            paperOrder = stored
+                            paperSort = StockSort.custom.rawValue
+                        }
+                    }
+                } header: {
+                    Text("拖动右侧手柄调整显示顺序")
+                }
+            }
+            .environment(\.editMode, .constant(.active))
+            .navigationTitle(editingFilmOrder ? "排列胶片" : "排列相纸")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { showingStockOrder = false }
+                }
+            }
+        }
+    }
+
+    private var browserCategories: [String] {
+        if browsingFilm {
+            return ["全部", "彩色负片", "电影负片", "黑白胶片", "反转片"]
+        }
+        let available = Set(catalog.papers.map(\.category))
+        return ["全部", "推荐搭配", "彩色相纸", "电影拷贝", "黑白相纸"]
+            .filter { $0 == "全部" || $0 == "推荐搭配" || available.contains($0) }
+    }
+
+    private var browserStocks: [Stock] {
+        let all = browsingFilm ? catalog.films : catalog.papers
+        let sorted = orderedStocks(all, isFilm: browsingFilm)
+        let ordered = browsingFilm ? sorted : sorted.filter(isPaperCompatible)
+            + sorted.filter { !isPaperCompatible($0) }
+        return ordered.filter { stock in
+            let matchesCategory: Bool
+            if browserCategory == "推荐搭配" {
+                matchesCategory = stock.id == selectedFilm?.targetPrint
+            } else {
+                matchesCategory = browserCategory == "全部" || stock.category == browserCategory
+            }
+            return matchesCategory && (stockQuery.isEmpty ||
+                stock.label.localizedStandardContains(stockQuery) ||
+                stock.originalName.localizedStandardContains(stockQuery) ||
+                stock.id.localizedStandardContains(stockQuery))
+        }
+    }
+
+    private func matchDescription(_ stock: Stock) -> String {
+        if browsingFilm {
+            if stock.strongHalation { return "强光晕 · 明亮文字和边缘可能发光" }
+            if stock.positive { return "反转片 · 自动直接扫描" }
+            return stock.category
+        }
+        guard let selected = selectedFilm else { return stock.category }
+        if selected.targetPrint == stock.id { return "推荐搭配 · \(stock.category)" }
+        return isPaperCompatible(stock)
+            ? "可搭配 · \(stock.category)"
+            : "当前胶片不可搭配"
+    }
+
+    private var stockBrowserSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Picker("类型", selection: $browserCategory) {
+                        ForEach(browserCategories, id: \.self) { category in
+                            Text(category).tag(category)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                } footer: {
+                    Text(browsingFilm
+                         ? "CineStill 800T 的强光晕来自原始胶片配置，可在微调中调低或关闭。"
+                         : "可搭配的相纸排在前面；置灰的相纸没有对应滤色数据，无法选择。")
+                }
+                Section {
+                    ForEach(browserStocks) { stock in
+                        Button {
+                            chooseStock(stock, isFilm: browsingFilm)
+                            showingStockBrowser = false
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(stock.label)
+                                        .foregroundStyle(.primary)
+                                    Text(stock.originalName)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(matchDescription(stock))
+                                        .font(.caption2)
+                                        .foregroundStyle(stock.strongHalation
+                                                         ? DarkroomStyle.accent : .secondary)
+                                }
+                                Spacer(minLength: 0)
+                                if stock.id == (browsingFilm ? film : paper) {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(DarkroomStyle.accent)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .disabled(!browsingFilm && !isPaperCompatible(stock))
+                        .opacity(browsingFilm || isPaperCompatible(stock) ? 1 : 0.4)
+                    }
+                } header: {
+                    Text("共 \(browserStocks.count) 项")
+                }
+            }
+            .searchable(text: $stockQuery, prompt: "搜索名称、品牌或感光度")
+            .navigationTitle(browsingFilm ? "选择胶片" : "选择相纸")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { showingStockBrowser = false }
+                }
+            }
         }
     }
 
@@ -588,6 +1099,116 @@ private struct EditorView: View {
             }
         }
         .padding(.horizontal, 24)
+    }
+
+    private func switchAdjustment(_ title: String, value: Binding<Bool>) -> some View {
+        Toggle(title, isOn: value)
+            .font(.system(size: 14))
+            .onChange(of: value.wrappedValue) { _, _ in
+                if selectedURL != nil { process(tier: "live") }
+            }
+    }
+
+    private var adjustmentSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    adjustmentGroup("拍摄与底片") {
+                        switchAdjustment("自动测光", value: $settings.autoExposure)
+                        adjustment("胶片曝光", value: $settings.exposure, range: -8...8, format: "%.1f EV")
+                        adjustment("画幅宽度", value: $settings.filmFormat, range: 4...200, format: "%.0f mm")
+                        adjustment("镜头模糊", value: $settings.lensBlur, range: 0...50, format: "%.1f µm")
+                        adjustment("底片曲线", value: $settings.densityGamma, range: 0.2...4, format: "%.2f")
+                        adjustment("扫描镜头模糊", value: $settings.scannerBlur, range: 0...20,
+                                   format: "%.1f")
+                    }
+                    adjustmentGroup("场景宽容度") {
+                        switchAdjustment("启用宽容度映射", value: $settings.latitudeActive)
+                        adjustment("高光拐点", value: $settings.highlightKnee, range: -4...8,
+                                   format: "%+.1f EV")
+                        adjustment("高光空间", value: $settings.highlightRoom, range: 0...8,
+                                   format: "%.1f EV")
+                        adjustment("暗部拐点", value: $settings.shadowKnee, range: -8...4,
+                                   format: "%+.1f EV")
+                        adjustment("暗部空间", value: $settings.shadowRoom, range: 0...8,
+                                   format: "%.1f EV")
+                        adjustment("过渡柔和度", value: $settings.latitudeRolloff, range: 1...4,
+                                   format: "%.1f")
+                    }
+                    adjustmentGroup("放大与印相") {
+                        if paper == "ilford_multigrade_iv_rc" {
+                            Picker("黑白相纸反差等级", selection: $settings.paperGrade) {
+                                ForEach(["00", "0", "1", "2", "3", "4", "5"], id: \.self) {
+                                    Text($0).tag($0)
+                                }
+                            }
+                            .onChange(of: settings.paperGrade) { _, _ in
+                                if selectedURL != nil { process(tier: "live") }
+                            }
+                        }
+                        adjustment("印相曝光", value: $settings.printExposure, range: 0.05...4, format: "%.2f")
+                        adjustment("滤色幅度", value: $settings.filterScale, range: 1...60, format: "%.0f CC")
+                        adjustment("品红滤色", value: $settings.magenta, range: -1...1, format: "%+.2f")
+                        adjustment("黄色滤色", value: $settings.yellow, range: -1...1, format: "%+.2f")
+                        adjustment("预曝光", value: $settings.preflash, range: 0...1, format: "%.2f")
+                    }
+                    adjustmentGroup("胶片质感") {
+                        switchAdjustment("颗粒", value: $settings.grainActive)
+                        adjustment("颗粒强度", value: $settings.grain, range: 0...2, format: "%.2f")
+                        switchAdjustment("光晕", value: $settings.halationActive)
+                        adjustment("光晕面积", value: $settings.halation, range: 0...4, format: "%.2f")
+                        adjustment("高光光晕补偿", value: $settings.halationBoost, range: 0...8,
+                                   format: "%.1f EV")
+                        adjustment("散射", value: $settings.scatter, range: 0...1, format: "%.2f")
+                        switchAdjustment("移除防光晕层", value: $settings.antiHalationRemoved)
+                        switchAdjustment("成色剂耦合", value: $settings.dirActive)
+                        adjustment("耦合强度", value: $settings.dirCouplers, range: 0...4, format: "%.2f")
+                    }
+                    adjustmentGroup("相纸与局部反差") {
+                        switchAdjustment("扫描白点校正", value: $settings.scannerWhite)
+                        switchAdjustment("扫描黑点校正", value: $settings.scannerBlack)
+                        switchAdjustment("相纸眩光", value: $settings.glareActive)
+                        adjustment("眩光面积", value: $settings.glare, range: 0...30, format: "%.1f")
+                        switchAdjustment("反差蒙版", value: $settings.contrastMaskActive)
+                        adjustment("高光", value: $settings.contrastHighlights, range: 0...3, format: "%.2f")
+                        adjustment("阴影", value: $settings.contrastShadows, range: 0...3, format: "%.2f")
+                        adjustment("核心宽度", value: $settings.contrastCore, range: 0...3, format: "%.2f")
+                        adjustment("蒙版尺度", value: $settings.contrastScale, range: 0.002...0.12,
+                                   format: "%.3f")
+                    }
+                    Button("恢复默认参数") {
+                        settings = RenderSettings()
+                        if selectedURL != nil { process(tier: "live") }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.bottom, 20)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 16)
+            }
+            .background(DarkroomStyle.background)
+            .navigationTitle("微调")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { showingAdjustments = false }
+                }
+            }
+        }
+    }
+
+    private func adjustmentGroup<Content: View>(
+        _ title: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 13) {
+            Text(title)
+                .font(.system(size: 16, weight: .semibold, design: .serif))
+                .foregroundStyle(DarkroomStyle.accent)
+            content()
+        }
+        .padding(.vertical, 18)
+        .padding(.horizontal, 4)
+        .background(DarkroomStyle.panel, in: RoundedRectangle(cornerRadius: 20))
     }
 
     private func importPhoto(_ item: PhotosPickerItem) {
@@ -619,13 +1240,12 @@ private struct EditorView: View {
     private func process(tier: String) {
         guard let url = selectedURL else { return }
         isWorking = true
-        let film = film, paper = paper, exposure = exposure
-        let printExposure = printExposure, grain = grain
+        let film = film, paper = paper, settings = settings
         Task {
             do {
                 let result = try await engine.render(
-                    url: url, film: film, paper: paper, exposure: exposure,
-                    printExposure: printExposure, grain: grain, tier: tier
+                    url: url, film: film, paper: paper, scanFilm: scanFilm,
+                    settings: settings, tier: tier
                 )
                 let picture = try result.image()
                 preview = picture

@@ -3,6 +3,8 @@
 __MACOSX/
 
 ios/.build/
+ios/.signing-helper/
+ios/.signing-derived/
 ios/out/
 *.ipa
 *.mobileprovision
@@ -10,3 +12,4 @@ ios/out/
 
 # Local chat export; never publish conversation or device details.
 你好-*.md
+ios/.preview-build/

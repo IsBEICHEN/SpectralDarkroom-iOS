@@ -26,6 +26,8 @@ xcrun ar rcs "$build/libspektrafilm.a" "$build"/objects/*.o
 rm -rf "$build/Payload"
 mkdir -p "$app/engine/shaders" "$app/Licenses"
 cp "$root/ios/SpectralDarkroom/Info.plist" "$app/Info.plist"
+mkdir -p "$app/zh-Hans.lproj"
+cp "$root/ios/SpectralDarkroom/zh-Hans.lproj/InfoPlist.strings" "$app/zh-Hans.lproj/"
 xcrun actool --compile "$app" --platform iphoneos \
     --minimum-deployment-target 18.0 --target-device iphone \
     --app-icon AppIcon \
@@ -36,11 +38,22 @@ cp -R "$root/engine/resources/." "$app/engine/"
 cp "$root/engine/src/shaders/"*.metal "$root/engine/src/shaders/spk_common.h" "$app/engine/shaders/"
 if [[ -d "$root/engine/resources_product/profiles" ]]; then
     cp "$root/engine/resources_product/profiles/"*.json "$app/engine/profiles/"
+    python3 "$root/ios/Tools/merge-product-filters.py" \
+        "$root/engine/resources/neutral_print_filters.json" \
+        "$root/engine/resources_product/neutral_print_filters.json" \
+        "$app/engine/neutral_print_filters.json"
+    cp "$root/engine/resources_product/paper_grades.json" "$app/paper_grades.json"
     cp "$root/engine/resources_product/NOTICE.md" "$app/Licenses/PRODUCT_PROFILES_NOTICE.md"
 fi
+python3 "$root/ios/Tools/make-stock-catalog.py" "$app/engine" "$app/stock-catalog.json"
 cp "$root/LICENSE.txt" "$app/Licenses/GPL-3.0.txt"
 cp "$root/engine/third_party/metal-cpp/LICENSE.txt" "$app/Licenses/Apache-2.0.txt"
 cp "$root/ios/SpectralDarkroom/NOTICE.md" "$app/Licenses/NOTICE.md"
+cp "$root/ios/Tools/reference-images/NOTICE.md" "$app/Licenses/StockPreviews-NOTICE.md"
+if [[ -d "$root/ios/SpectralDarkroom/StockPreviews" ]]; then
+    mkdir -p "$app/StockPreviews"
+    cp -R "$root/ios/SpectralDarkroom/StockPreviews/." "$app/StockPreviews/"
+fi
 
 xcrun --sdk iphoneos swiftc -disable-sandbox -parse-as-library \
     -target "$target" -sdk "$sdk" \
